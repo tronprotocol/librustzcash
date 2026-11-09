@@ -1365,6 +1365,11 @@ pub extern "system" fn librustzcash_sapling_output_proof(
     cv: *mut [c_uchar; 32],
     zkproof: *mut [c_uchar; GROTH_PROOF_SIZE],
 ) -> bool {
+    let parameters = match unsafe { SAPLING_OUTPUT_PARAMS.as_ref() } {
+        Some(parameters) => parameters,
+        None => return false,
+    };
+
     // Grab `esk`, which the caller should have constructed for the DH key exchange.
     let esk = match Fs::from_repr(read_fs(&(unsafe { &*esk })[..])) {
         Ok(p) => p,
@@ -1406,16 +1411,6 @@ pub extern "system" fn librustzcash_sapling_output_proof(
     // blinding factor `bsk` is accumulated in the context.
     let rcv = Fs::rand(&mut rng);
 
-    // Accumulate the value commitment randomness in the context
-    {
-        let mut tmp = rcv.clone();
-        tmp.negate(); // Outputs subtract from the total.
-        tmp.add_assign(&unsafe { &*ctx }.bsk);
-
-        // Update the context
-        unsafe { &mut *ctx }.bsk = tmp;
-    }
-
     // Construct the value commitment for the proof instance
     let value_commitment = sapling_crypto::primitives::ValueCommitment::<Bls12> {
         value: value,
@@ -1432,34 +1427,35 @@ pub extern "system" fn librustzcash_sapling_output_proof(
     };
 
     // Create proof
-    let proof = create_random_proof(
-        instance,
-        unsafe { SAPLING_OUTPUT_PARAMS.as_ref() }.unwrap(),
-        &mut rng,
-    ).expect("proving should not fail");
-
-    // Write the proof out to the caller
-    proof
-        .write(&mut (unsafe { &mut *zkproof })[..])
-        .expect("should be able to serialize a proof");
+    let proof = match create_random_proof(instance, parameters, &mut rng) {
+        Ok(proof) => proof,
+        Err(_) => return false,
+    };
 
     // Compute the value commitment
     let value_commitment: edwards::Point<Bls12, Unknown> = value_commitment.cm(&JUBJUB).into();
 
-    // Accumulate the value commitment in the context. We do this to check internal consistency.
+    // Prepare all output before changing caller-owned state.
+    let mut cv_bytes = [0u8; 32];
+    let mut proof_bytes = [0u8; GROTH_PROOF_SIZE];
+    if value_commitment.write(&mut cv_bytes[..]).is_err()
+        || proof.write(&mut proof_bytes[..]).is_err()
     {
-        let mut tmp = value_commitment.clone();
-        tmp = tmp.negate(); // Outputs subtract from the total.
-        tmp = tmp.add(&unsafe { &*ctx }.bvk, &JUBJUB);
-
-        // Update the context
-        unsafe { &mut *ctx }.bvk = tmp;
+        return false;
     }
 
-    // Write the value commitment to the caller
-    value_commitment
-        .write(&mut (unsafe { &mut *cv })[..])
-        .expect("should be able to serialize rcv");
+    let mut bsk = rcv;
+    bsk.negate(); // Outputs subtract from the total.
+    bsk.add_assign(&unsafe { &*ctx }.bsk);
+    let bvk = value_commitment.negate().add(&unsafe { &*ctx }.bvk, &JUBJUB);
+
+    // No fallible operations remain: commit the context and outputs together.
+    unsafe {
+        (*ctx).bsk = bsk;
+        (*ctx).bvk = bvk;
+        *cv = cv_bytes;
+        *zkproof = proof_bytes;
+    }
 
     true
 }
@@ -1589,37 +1585,40 @@ pub extern "system" fn librustzcash_sapling_spend_proof(
     rk_out: *mut [c_uchar; 32],
     zkproof: *mut [c_uchar; GROTH_PROOF_SIZE],
 ) -> bool {
-
-    let mut rng = OsRng::new().expect("should be able to construct RNG");
-
-    // We create the randomness of the value commitment
-    let rcv = Fs::rand(&mut rng);
-
-    // Accumulate the value commitment randomness in the context
-    {
-        let mut tmp = rcv.clone();
-        tmp.add_assign(&unsafe { &*ctx }.bsk);
-
-        // Update the context
-        unsafe { &mut *ctx }.bsk = tmp;
-    }
-
-    // Construct the value commitment
-    let value_commitment = ValueCommitment::<Bls12> {
-        value: value,
-        randomness: rcv,
-    };
-
     // Grab `ak` from the caller, which should be a point.
     let ak = match edwards::Point::<Bls12, Unknown>::read(&(unsafe { &*ak })[..], &JUBJUB) {
         Ok(p) => p,
         Err(_) => return false,
     };
 
+    if is_small_order(&ak) {
+        return false;
+    }
+
     // `ak` should be prime order.
     let ak = match ak.as_prime_order(&JUBJUB) {
         Some(p) => p,
         None => return false,
+    };
+
+    let parameters = match unsafe { SAPLING_SPEND_PARAMS.as_ref() } {
+        Some(parameters) => parameters,
+        None => return false,
+    };
+    let verifying_key = match unsafe { SAPLING_SPEND_VK.as_ref() } {
+        Some(key) => key,
+        None => return false,
+    };
+
+    let mut rng = OsRng::new().expect("should be able to construct RNG");
+
+    // We create the randomness of the value commitment
+    let rcv = Fs::rand(&mut rng);
+
+    // Construct the value commitment
+    let value_commitment = ValueCommitment::<Bls12> {
+        value: value,
+        randomness: rcv,
     };
 
     // Grab `nsk` from the caller
@@ -1665,10 +1664,6 @@ pub extern "system" fn librustzcash_sapling_spend_proof(
         &JUBJUB,
     );
 
-    // Write out `rk` to the caller
-    rk.write(&mut unsafe { &mut *rk_out }[..])
-        .expect("should be able to write to rk_out");
-
     // We need to compute the anchor of the Spend.
     let anchor = match Fr::from_repr(read_le(unsafe { &(&*anchor)[..] })) {
         Ok(p) => p,
@@ -1681,7 +1676,9 @@ pub extern "system" fn librustzcash_sapling_spend_proof(
 
     // Skip the first byte, which should be "32" to signify the length of
     // the following vector of Pedersen hashes.
-    assert_eq!(witness[0], SAPLING_TREE_DEPTH as u8);
+    if witness[0] != SAPLING_TREE_DEPTH as u8 {
+        return false;
+    }
     witness = &witness[1..];
 
     // Begin to construct the authentication path
@@ -1690,7 +1687,9 @@ pub extern "system" fn librustzcash_sapling_spend_proof(
     // The vector works in reverse
     for i in (0..SAPLING_TREE_DEPTH).rev() {
         // skip length of inner vector
-        assert_eq!(witness[0], 32); // the length of a pedersen hash
+        if witness[0] != 32 {
+            return false;
+        }
         witness = &witness[1..];
 
         // Grab the sibling node at this depth in the tree
@@ -1753,11 +1752,10 @@ pub extern "system" fn librustzcash_sapling_spend_proof(
     };
 
     // Create proof
-    let proof = create_random_proof(
-        instance,
-        unsafe { SAPLING_SPEND_PARAMS.as_ref() }.unwrap(),
-        &mut rng,
-    ).expect("proving should not fail");
+    let proof = match create_random_proof(instance, parameters, &mut rng) {
+        Ok(proof) => proof,
+        Err(_) => return false,
+    };
 
     // Try to verify the proof:
     // Construct public input for circuit
@@ -1787,7 +1785,7 @@ pub extern "system" fn librustzcash_sapling_spend_proof(
 
     // Verify the proof
     match verify_proof(
-        unsafe { SAPLING_SPEND_VK.as_ref() }.unwrap(),
+        verifying_key,
         &proof,
         &public_input[..],
     ) {
@@ -1803,24 +1801,29 @@ pub extern "system" fn librustzcash_sapling_spend_proof(
     // Compute value commitment
     let value_commitment: edwards::Point<Bls12, Unknown> = value_commitment.cm(&JUBJUB).into();
 
-    // Accumulate the value commitment in the context
+    // Prepare all output before changing caller-owned state.
+    let mut cv_bytes = [0u8; 32];
+    let mut rk_bytes = [0u8; 32];
+    let mut proof_bytes = [0u8; GROTH_PROOF_SIZE];
+    if value_commitment.write(&mut cv_bytes[..]).is_err()
+        || rk.write(&mut rk_bytes[..]).is_err()
+        || proof.write(&mut proof_bytes[..]).is_err()
     {
-        let mut tmp = value_commitment.clone();
-        tmp = tmp.add(&unsafe { &*ctx }.bvk, &JUBJUB);
-
-        // Update the context
-        unsafe { &mut *ctx }.bvk = tmp;
+        return false;
     }
 
-    // Write value commitment to caller
-    value_commitment
-        .write(&mut unsafe { &mut *cv }[..])
-        .expect("should be able to serialize cv");
+    let mut bsk = rcv;
+    bsk.add_assign(&unsafe { &*ctx }.bsk);
+    let bvk = value_commitment.add(&unsafe { &*ctx }.bvk, &JUBJUB);
 
-    // Write proof out to caller
-    proof
-        .write(&mut (unsafe { &mut *zkproof })[..])
-        .expect("should be able to serialize a proof");
+    // No fallible operations remain: commit the context and outputs together.
+    unsafe {
+        (*ctx).bsk = bsk;
+        (*ctx).bvk = bvk;
+        *cv = cv_bytes;
+        *rk_out = rk_bytes;
+        *zkproof = proof_bytes;
+    }
 
     true
 }
@@ -1860,14 +1863,28 @@ pub extern "system" fn librustzcash_zip32_xsk_derive(
     i: uint32_t,
     xsk_i: *mut [c_uchar; 169],
 ) {
-    let xsk_parent = zip32::ExtendedSpendingKey::read(&unsafe { *xsk_parent }[..])
-        .expect("valid ExtendedSpendingKey");
+    librustzcash_zip32_xsk_derive_checked(xsk_parent, i, xsk_i);
+}
+
+#[no_mangle]
+pub extern "system" fn librustzcash_zip32_xsk_derive_checked(
+    xsk_parent: *const [c_uchar; 169],
+    i: uint32_t,
+    xsk_i: *mut [c_uchar; 169],
+) -> bool {
+    let encoded = unsafe { &*xsk_parent };
+    if encoded[0] == 255 {
+        return false;
+    }
+    let xsk_parent = match zip32::ExtendedSpendingKey::read(&encoded[..]) {
+        Ok(key) => key,
+        Err(_) => return false,
+    };
     let i = zip32::ChildIndex::from_index(i);
 
     let xsk = xsk_parent.derive_child(i);
 
-    xsk.write(&mut (unsafe { &mut *xsk_i })[..])
-        .expect("should be able to serialize an ExtendedSpendingKey");
+    xsk.write(&mut (unsafe { &mut *xsk_i })[..]).is_ok()
 }
 
 #[no_mangle]
@@ -1876,8 +1893,14 @@ pub extern "system" fn librustzcash_zip32_xfvk_derive(
     i: uint32_t,
     xfvk_i: *mut [c_uchar; 169],
 ) -> bool {
-    let xfvk_parent = zip32::ExtendedFullViewingKey::read(&unsafe { *xfvk_parent }[..])
-        .expect("valid ExtendedFullViewingKey");
+    let encoded = unsafe { &*xfvk_parent };
+    if encoded[0] == 255 {
+        return false;
+    }
+    let xfvk_parent = match zip32::ExtendedFullViewingKey::read(&encoded[..]) {
+        Ok(key) => key,
+        Err(_) => return false,
+    };
     let i = zip32::ChildIndex::from_index(i);
 
     let xfvk = match xfvk_parent.derive_child(i) {
@@ -1898,8 +1921,10 @@ pub extern "system" fn librustzcash_zip32_xfvk_address(
     j_ret: *mut [c_uchar; 11],
     addr_ret: *mut [c_uchar; 43],
 ) -> bool {
-    let xfvk = zip32::ExtendedFullViewingKey::read(&unsafe { *xfvk }[..])
-        .expect("valid ExtendedFullViewingKey");
+    let xfvk = match zip32::ExtendedFullViewingKey::read(&unsafe { *xfvk }[..]) {
+        Ok(key) => key,
+        Err(_) => return false,
+    };
     let j = zip32::DiversifierIndex(unsafe { *j });
 
     let addr = match xfvk.address(j) {
@@ -1921,4 +1946,108 @@ pub extern "system" fn librustzcash_zip32_xfvk_address(
         .expect("should be able to serialize a PaymentAddress");
 
     true
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn missing_proving_parameters_preserve_context_and_outputs() {
+        // This test binary never initializes proving parameters; Java integration
+        // tests exercise failures and successful retries with parameters loaded.
+        assert!(unsafe { SAPLING_SPEND_PARAMS.as_ref() }.is_none());
+        assert!(unsafe { SAPLING_OUTPUT_PARAMS.as_ref() }.is_none());
+        let point = JUBJUB.generator(FixedGenerators::SpendingKeyGenerator);
+        let mut key = [0u8; 32];
+        point.write(&mut key[..]).unwrap();
+        let mut ctx = SaplingProvingContext {
+            bsk: Fs::one(),
+            bvk: point.clone().into(),
+        };
+        let saved_bvk = ctx.bvk.clone();
+        let diversifier = [0x4c, 0x41, 0x8c, 0xf6, 0x5a, 0x72, 0x10, 0xd9, 0xb6, 0x65, 0x88];
+        let mut witness = [0u8; 1 + 33 * SAPLING_TREE_DEPTH + 8];
+        witness[0] = SAPLING_TREE_DEPTH as u8;
+        for i in 0..SAPLING_TREE_DEPTH {
+            witness[1 + 33 * i] = 32;
+        }
+        let mut cv = [9u8; 32];
+        let mut rk = [9u8; 32];
+        let mut proof = [9u8; GROTH_PROOF_SIZE];
+        assert!(!librustzcash_sapling_spend_proof(
+            &mut ctx, &key, &[0u8; 32], &diversifier, &[0u8; 32], &[0u8; 32],
+            0, &[0u8; 32], &witness, &mut cv, &mut rk, &mut proof,
+        ));
+        assert!(ctx.bsk == Fs::one());
+        assert!(ctx.bvk == saved_bvk);
+        assert_eq!(cv, [9u8; 32]);
+        assert_eq!(rk, [9u8; 32]);
+        assert!(proof.iter().all(|b| *b == 9));
+
+        assert!(!librustzcash_sapling_output_proof(
+            &mut ctx, &[0u8; 32], &diversifier, &key, &[0u8; 32], 0,
+            &mut cv, &mut proof,
+        ));
+        assert!(ctx.bsk == Fs::one());
+        assert!(ctx.bvk == saved_bvk);
+        assert_eq!(cv, [9u8; 32]);
+        assert!(proof.iter().all(|b| *b == 9));
+    }
+
+    #[test]
+    fn identity_spend_keys_are_rejected_before_context_changes() {
+        for sign in &[0u8, 0x80] {
+            let mut ak = [0u8; 32];
+            ak[0] = 1;
+            ak[31] = *sign;
+            let ctx = librustzcash_sapling_proving_ctx_init();
+            let mut cv = [9u8; 32];
+            let mut rk = [9u8; 32];
+            let mut proof = [9u8; GROTH_PROOF_SIZE];
+            assert!(!librustzcash_sapling_spend_proof(
+                ctx, &ak, &[0u8; 32], &[0u8; 11], &[0u8; 32], &[0u8; 32],
+                0, &[0u8; 32], &[0u8; 1 + 33 * SAPLING_TREE_DEPTH + 8],
+                &mut cv, &mut rk, &mut proof,
+            ));
+            assert!(unsafe { &*ctx }.bsk == Fs::zero());
+            assert!(unsafe { &*ctx }.bvk == edwards::Point::zero());
+            assert_eq!(cv, [9u8; 32]);
+            assert_eq!(rk, [9u8; 32]);
+            librustzcash_sapling_proving_ctx_free(ctx);
+        }
+    }
+
+    #[test]
+    fn zip32_rejects_invalid_keys_and_exhausted_depth() {
+        let mut invalid = [0xffu8; 169];
+        invalid[0] = 0;
+        let mut output = [7u8; 169];
+        assert!(!librustzcash_zip32_xsk_derive_checked(&invalid, 0, &mut output));
+        assert!(!librustzcash_zip32_xfvk_derive(&invalid, 0, &mut output));
+        let mut j_ret = [7u8; 11];
+        let mut address = [7u8; 43];
+        assert!(!librustzcash_zip32_xfvk_address(
+            &invalid, &[0u8; 11], &mut j_ret, &mut address,
+        ));
+        assert!(output.iter().all(|b| *b == 7));
+        assert_eq!(j_ret, [7u8; 11]);
+        assert!(address.iter().all(|b| *b == 7));
+
+        let seed = [0u8; 32];
+        let mut master = [0u8; 169];
+        librustzcash_zip32_xsk_master(seed.as_ptr(), seed.len(), &mut master);
+        assert!(librustzcash_zip32_xsk_derive_checked(&master, 0x80000000, &mut output));
+        let key = zip32::ExtendedSpendingKey::read(&master[..]).unwrap();
+        let fvk = zip32::ExtendedFullViewingKey::from(&key);
+        let mut viewing = [0u8; 169];
+        fvk.write(&mut viewing[..]).unwrap();
+        assert!(librustzcash_zip32_xfvk_address(
+            &viewing, &[0u8; 11], &mut j_ret, &mut address,
+        ));
+        master[0] = 255;
+        viewing[0] = 255;
+        assert!(!librustzcash_zip32_xsk_derive_checked(&master, 0, &mut output));
+        assert!(!librustzcash_zip32_xfvk_derive(&viewing, 0, &mut output));
+    }
 }

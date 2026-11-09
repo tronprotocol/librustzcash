@@ -88,6 +88,7 @@ extern "C" {
     /// given the necessary witness information. It outputs `cv` (the value
     /// commitment) and `rk` (so that you don't have to compute it) along
     /// with the proof.
+    /// On false, the proving context and all output buffers are unchanged.
     bool librustzcash_sapling_spend_proof(
         void *ctx,
         const unsigned char *ak,
@@ -106,6 +107,7 @@ extern "C" {
     /// This function (using the proving context) constructs an Output
     /// proof given the necessary witness information. It outputs `cv`
     /// and the `zkproof`.
+    /// On false, the proving context and all output buffers are unchanged.
     bool librustzcash_sapling_output_proof(
         void *ctx,
         const unsigned char *esk,
@@ -320,6 +322,13 @@ extern "C" {
 
     /// Derive a child ExtendedSpendingKey from a parent.
     void librustzcash_zip32_xsk_derive(
+        const unsigned char *xsk_parent,
+        uint32_t i,
+        unsigned char *xsk_i
+    );
+
+    /// Derive a child ExtendedSpendingKey, returning false for invalid input.
+    bool librustzcash_zip32_xsk_derive_checked(
         const unsigned char *xsk_parent,
         uint32_t i,
         unsigned char *xsk_i
